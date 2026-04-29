@@ -4,11 +4,15 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/dundee/gdu/v5/internal/common"
 	"github.com/dundee/gdu/v5/pkg/fs"
 	log "github.com/sirupsen/logrus"
 )
+
+var pathSep = string(os.PathSeparator)
 
 var _ common.Analyzer = (*TopDirAnalyzer)(nil)
 
@@ -18,14 +22,28 @@ var _ common.Analyzer = (*TopDirAnalyzer)(nil)
 // It tries to use only stack for storing state and results.
 type TopDirAnalyzer struct {
 	BaseAnalyzer
-	linkedItems sync.Map
+	progressItemCount atomic.Int64
+	progressTotalSize atomic.Int64
+	linkedItems       sync.Map
 }
 
 // CreateTopDirAnalyzer returns Analyzer
 func CreateTopDirAnalyzer() *TopDirAnalyzer {
-	a := &TopDirAnalyzer{}
+	a := &TopDirAnalyzer{
+		BaseAnalyzer: BaseAnalyzer{
+			ignoreFileType:      func(string) bool { return false },
+			matchesTimeFilterFn: func(time.Time) bool { return true },
+		},
+	}
 	a.Init()
 	return a
+}
+
+// ResetProgress returns progress
+func (a *TopDirAnalyzer) ResetProgress() {
+	a.BaseAnalyzer.ResetProgress()
+	a.progressItemCount.Store(0)
+	a.progressTotalSize.Store(0)
 }
 
 // AnalyzeDir analyzes given path
@@ -33,7 +51,9 @@ func (a *TopDirAnalyzer) AnalyzeDir(
 	path string, ignore common.ShouldDirBeIgnored, fileTypeFilter common.ShouldFileBeIgnored,
 ) fs.Item {
 	a.ignoreDir = ignore
-	a.ignoreFileType = fileTypeFilter
+	if fileTypeFilter != nil {
+		a.ignoreFileType = fileTypeFilter
+	}
 
 	var subDirChan = make(chan struct{})
 
@@ -58,7 +78,7 @@ func (a *TopDirAnalyzer) AnalyzeDir(
 
 	for _, f := range files {
 		name := f.Name()
-		entryPath := filepath.Join(path, name)
+		entryPath := path + pathSep + name
 		if f.IsDir() {
 			if a.ignoreDir(name, entryPath) {
 				continue
@@ -75,7 +95,7 @@ func (a *TopDirAnalyzer) AnalyzeDir(
 		} else {
 			var info os.FileInfo
 			// Apply file type filter if set
-			if a.ignoreFileType != nil && a.ignoreFileType(name) {
+			if a.ignoreFileType(name) {
 				continue // Skip this file
 			}
 
@@ -87,7 +107,7 @@ func (a *TopDirAnalyzer) AnalyzeDir(
 			}
 
 			// Apply time filter if set
-			if a.matchesTimeFilterFn != nil && !a.matchesTimeFilterFn(info.ModTime()) {
+			if !a.matchesTimeFilterFn(info.ModTime()) {
 				continue // Skip this file
 			}
 
@@ -153,11 +173,7 @@ func (a *TopDirAnalyzer) processSubDir(path string, topDir *TopDir) {
 		totalUsage int64 = 4096
 		totalCount int64
 		info       os.FileInfo
-		dirCount   int
-		subDirChan = make(chan struct{})
 	)
-
-	a.wait.Add(1)
 
 	files, err := os.ReadDir(path)
 	if err != nil {
@@ -167,24 +183,26 @@ func (a *TopDirAnalyzer) processSubDir(path string, topDir *TopDir) {
 
 	for _, f := range files {
 		name := f.Name()
-		entryPath := filepath.Join(path, name)
+		entryPath := path + pathSep + name
 		if f.IsDir() {
 			if a.ignoreDir(name, entryPath) {
 				continue
 			}
-			dirCount++
 
-			go func(entryPath string) {
-				concurrencyLimit <- struct{}{}
-
+			select {
+			case concurrencyLimit <- struct{}{}:
+				a.wait.Add(1)
+				go func(entryPath string) {
+					a.processSubDir(entryPath, topDir)
+					<-concurrencyLimit
+					a.wait.Done()
+				}(entryPath)
+			default:
 				a.processSubDir(entryPath, topDir)
-
-				subDirChan <- struct{}{}
-				<-concurrencyLimit
-			}(entryPath)
+			}
 		} else {
 			// Apply file type filter if set
-			if a.ignoreFileType != nil && a.ignoreFileType(name) {
+			if a.ignoreFileType(name) {
 				continue // Skip this file
 			}
 
@@ -198,7 +216,7 @@ func (a *TopDirAnalyzer) processSubDir(path string, topDir *TopDir) {
 			}
 
 			// Apply time filter if set
-			if a.matchesTimeFilterFn != nil && !a.matchesTimeFilterFn(info.ModTime()) {
+			if !a.matchesTimeFilterFn(info.ModTime()) {
 				continue // Skip this file
 			}
 
@@ -227,19 +245,29 @@ func (a *TopDirAnalyzer) processSubDir(path string, topDir *TopDir) {
 		}
 	}
 
-	a.progressChan <- common.CurrentProgress{
-		CurrentItemName: path,
-		ItemCount:       totalCount,
-		TotalSize:       totalUsage,
-	}
+	a.progressItemCount.Add(totalCount)
+	a.progressTotalSize.Add(totalUsage)
 
 	topDir.AddUsage(totalSize, totalUsage, totalCount+1)
+}
 
-	go func() {
-		for i := 0; i < dirCount; i++ {
-			<-subDirChan
+// UpdateProgress updates progress
+func (a *TopDirAnalyzer) UpdateProgress() {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-a.progressDoneChan:
+			return
+		case <-ticker.C:
+			progress := common.CurrentProgress{
+				ItemCount: a.progressItemCount.Load(),
+				TotalSize: a.progressTotalSize.Load(),
+			}
+			select {
+			case a.progressOutChan <- progress:
+			default:
+			}
 		}
-
-		a.wait.Done()
-	}()
+	}
 }
